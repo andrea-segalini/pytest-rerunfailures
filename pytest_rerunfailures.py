@@ -1,6 +1,7 @@
 import hashlib
 import os
 import platform
+import random
 import re
 import socket
 import sys
@@ -9,6 +10,7 @@ import time
 import traceback
 import warnings
 from contextlib import suppress
+from copy import copy
 
 import pytest
 from _pytest.outcomes import fail
@@ -18,6 +20,7 @@ from pkg_resources import get_distribution
 from pkg_resources import parse_version
 
 HAS_RESULTLOG = False
+DELAY_BACKOFF_BASE_DEFAULT = 2
 
 try:
     from _pytest.resultlog import ResultLog
@@ -86,6 +89,28 @@ def pytest_addoption(parser):
         type=float,
         default=0,
         help="add time (seconds) delay between reruns.",
+    )
+    group._addoption(
+        "--reruns-delay-backoff",
+        action="store_true",
+        dest="reruns_delay_backoff",
+        help="vary delay between reruns with random exponential backoff "
+             "algorithm. Max delay between reruns starts from 'reruns-delay'."
+    )
+    group._addoption(
+        "--reruns-delay-backoff-base",
+        dest="reruns_delay_backoff_base",
+        type=int,
+        default=DELAY_BACKOFF_BASE_DEFAULT,
+        help="Set the base for the exponentiation operation that computes the "
+             "upper bound for the random backoff delay."
+    )
+    group._addoption(
+        "--reruns-delay-backoff-max",
+        dest="reruns_delay_backoff_max",
+        type=int,
+        help="The maximum value (seconds) used for the upper bound in "
+             "selecting the random backoff delay."
     )
 
 
@@ -160,6 +185,36 @@ def get_reruns_count(item):
     return reruns
 
 
+# Class to generate the backoff delay given the number of attempts.
+class RerunDelay():
+    def next_rerun_delay(self, iteration_nr):
+        raise NotImplementedError
+
+
+# Constant delay among reruns.
+class RerunDelayConst(RerunDelay):
+    def __init__(self, delay):
+        self._delay = delay
+
+    def next_rerun_delay(self, _):
+        return self._delay
+
+
+# Random exponential backoff delay.
+class RerunDelayExp(RerunDelay):
+    def __init__(self, factor, base, max):
+        self._factor = factor
+        self._base = base
+        self._max = max
+
+    def next_rerun_delay(self, iteration_nr):
+        upper = self._factor * (self._base**iteration_nr)
+        if self._max:
+            upper = min(self._max, upper)
+
+        return random.randint(self._factor, upper)
+
+
 def get_reruns_delay(item):
     rerun_marker = _get_marker(item)
 
@@ -167,12 +222,44 @@ def get_reruns_delay(item):
         if "reruns_delay" in rerun_marker.kwargs:
             delay = rerun_marker.kwargs["reruns_delay"]
         elif len(rerun_marker.args) > 1:
-            # check for arguments
+            # check for argument
             delay = rerun_marker.args[1]
         else:
             delay = 0
+
+        if "reruns_delay_backoff" in rerun_marker.kwargs:
+            delay_backoff = rerun_marker.kwargs["reruns_delay_backoff"]
+        elif len(rerun_marker.args) > 2:
+            # check for argument
+            delay_backoff = rerun_marker.args[2]
+        else:
+            delay_backoff = False
+
+        if "reruns_delay_backoff_base" in rerun_marker.kwargs:
+            delay_backoff_base = rerun_marker.kwargs["reruns_delay_backoff_base"]
+        elif len(rerun_marker.args) > 3:
+            # check for argument
+            delay_backoff_base = rerun_marker.args[3]
+        else:
+            delay_backoff_base = DELAY_BACKOFF_BASE_DEFAULT
+
+        if "reruns_delay_backoff_max" in rerun_marker.kwargs:
+            delay_backoff_max = rerun_marker.kwargs["reruns_delay_backoff_max"]
+        elif len(rerun_marker.args) > 4:
+            # check for argument
+            delay_backoff_max = rerun_marker.args[4]
+        else:
+            delay_backoff_max = None
+
     else:
         delay = item.session.config.option.reruns_delay
+
+        delay_backoff = item.session.config.option.reruns_delay_backoff
+
+        delay_backoff_base = \
+            item.session.config.option.reruns_delay_backoff_base
+
+        delay_backoff_max = item.session.config.option.reruns_delay_backoff_max
 
     if delay < 0:
         delay = 0
@@ -180,7 +267,23 @@ def get_reruns_delay(item):
             "Delay time between re-runs cannot be < 0. Using default value: 0"
         )
 
-    return delay
+    if delay_backoff_base < 0:
+        delay_backoff_base = DELAY_BACKOFF_BASE_DEFAULT
+        warnings.warn(
+            "Exponential backoff base cannot be < 0. Using default value "
+            f"{DELAY_BACKOFF_BASE_DEFAULT}"
+        )
+
+    if delay_backoff_max and delay_backoff_max < 0:
+        delay_backoff_max = None
+        warnings.warn(
+            "Max value for exponential backoff cannot be < 0. "
+            "Not enforcing it."
+        )
+
+    if delay_backoff:
+        return RerunDelayExp(delay, delay_backoff_base, delay_backoff_max)
+    return RerunDelayConst(delay)
 
 
 def get_reruns_condition(item):
@@ -311,9 +414,13 @@ def pytest_configure(config):
     # add flaky marker
     config.addinivalue_line(
         "markers",
-        "flaky(reruns=1, reruns_delay=0): mark test to re-run up "
-        "to 'reruns' times. Add a delay of 'reruns_delay' seconds "
-        "between re-runs.",
+        "flaky(reruns=1, reruns_delay=0, reruns_delay_backoff=True, "
+        "reruns_delay_backoff_base=2, reruns_delay_backoff_max=3600): mark "
+        "test to re-run up to 'reruns' times. Add a delay of 'reruns_delay' "
+        "seconds between re-runs. Vary delay according to random exponential "
+        "backoff with 'reruns_delay_backoff' (base and max delay set with "
+        "'reruns_delay_backoff_base' and 'reruns_delay_backoff_max' "
+        "arguments)",
     )
 
     if HAS_PYTEST_HANDLECRASHITEM:
@@ -480,7 +587,7 @@ def pytest_runtest_protocol(item, nextitem):
     # while this doesn't need to be run with every item, it will fail on the
     # first item if necessary
     check_options(item.session.config)
-    delay = get_reruns_delay(item)
+    delay_generator = get_reruns_delay(item)
     parallel = not is_master(item.config)
     item_location = (item.location[0] + "::" + item.location[2]).replace("\\", "/")
     db = item.session.config.failures_db
@@ -504,7 +611,8 @@ def pytest_runtest_protocol(item, nextitem):
             else:
                 # failure detected and reruns not exhausted, since i < reruns
                 report.outcome = "rerun"
-                time.sleep(delay)
+                time.sleep(
+                    delay_generator.next_rerun_delay(item.execution_count - 1))
 
                 if not parallel or works_with_current_xdist():
                     # will rerun test, log intermediate result
