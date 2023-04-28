@@ -71,6 +71,16 @@ test re-run is launched:
 
    $ pytest --reruns 5 --reruns-delay 1
 
+To use a random backoff to vary the delay, use the ``--reruns-delay-backoff``
+command line options. This causes the delay to be picked randomly between 0
+and a maximum value that doubles on every failure (starting value is set by
+``--reruns-delay``):
+
+.. code-block:: bash
+
+   $ pytest --reruns 5 --reruns-delay 1 --reruns-delay-backoff
+
+
 Re-run all failures matching certain expressions
 ------------------------------------------------
 
@@ -106,11 +116,11 @@ test to run:
 Note that when teardown fails, two reports are generated for the case, one for
 the test case and the other for the teardown error.
 
-You can also specify the re-run delay time in the marker:
+You can also specify the re-run delay time in the marker and backoff:
 
 .. code-block:: python
 
-  @pytest.mark.flaky(reruns=5, reruns_delay=2)
+  @pytest.mark.flaky(reruns=5, reruns_delay=2, reruns_delay_backoff=False)
   def test_example():
       import random
       assert random.choice([True, False])
