@@ -6,6 +6,7 @@ import pytest
 from pkg_resources import parse_version
 
 from pytest_rerunfailures import HAS_PYTEST_HANDLECRASHITEM
+from pytest_rerunfailures import DELAY_BACKOFF_BASE_DEFAULT
 
 
 pytest_plugins = "pytester"
@@ -359,6 +360,126 @@ def test_reruns_with_delay_marker(testdir, delay_time):
     time.sleep.assert_called_with(delay_time)
 
     assert_outcomes(result, passed=0, failed=1, rerun=2)
+
+
+@pytest.mark.parametrize(("factor", "exp_base", "exp_max", "expected"), [
+    (-1, 2, None, [0, 0, 0]),     # Negative factor, apply default 0.
+    (3, 2, None, [3, 6, 12]),
+    (3, None, None, [3, 6, 12]),  # Missing base, apply default 2.
+    (3, 2, 7, [3, 6, 7]),
+    (3, 2, -1, [3, 6, 12]),       # Negative max, not considered.
+    (3, -1, None, [3, 6, 12]),    # Negative base, apply default 2.
+    (3, 3, None, [3, 9, 27]),
+])
+def test_reruns_backoff(testdir, monkeypatch, factor, exp_base,
+                        exp_max, expected):
+    testdir.makepyfile(
+        """
+        def test_fail():
+            assert False
+        """
+    )
+
+    # Always return upper bound.
+    monkeypatch.setattr(random, "randint", lambda _, max: max)
+
+    time.sleep = mock.MagicMock()
+
+    pytest_args = [
+        "--reruns", "3",
+        "--reruns-delay", str(factor),
+        "--reruns-delay-backoff"
+    ]
+    if exp_base:
+        pytest_args += ["--reruns-delay-backoff-base", str(exp_base)]
+    if exp_max:
+        pytest_args += ["--reruns-delay-backoff-max", str(exp_max)]
+
+    result = testdir.runpytest(*pytest_args)
+
+    if factor < 0:
+        result.stdout.fnmatch_lines(
+            "*UserWarning: Delay time between re-runs cannot be < 0. "
+            "Using default value: 0"
+        )
+        factor = 0
+
+    if exp_base and exp_base < 0:
+        result.stdout.fnmatch_lines(
+            "*UserWarning: Exponential backoff base cannot be < 0. "
+            f"Using default value {DELAY_BACKOFF_BASE_DEFAULT}"
+        )
+        exp_base = DELAY_BACKOFF_BASE_DEFAULT
+
+    if exp_max and exp_max < 0:
+        result.stdout.fnmatch_lines(
+            "*UserWarning: Max value for exponential backoff "
+            "cannot be < 0. Do not enforce it"
+        )
+        exp_base = None
+
+    time.sleep.assert_has_calls([mock.call(e) for e in expected])
+
+    assert_outcomes(result, passed=0, failed=1, rerun=3)
+
+
+@pytest.mark.parametrize(("factor", "exp_base", "exp_max", "expected"), [
+    (-1, 2, None, [0, 0, 0]),     # Negative factor, apply default 0.
+    (3, 2, None, [3, 6, 12]),
+    (3, None, None, [3, 6, 12]),  # Missing base, apply default 2.
+    (3, 2, 7, [3, 6, 7]),
+    (3, 2, -1, [3, 6, 12]),       # Negative max, not considered.
+    (3, -1, None, [3, 6, 12]),    # Negative base, apply default 2.
+    (3, 3, None, [3, 9, 27])
+])
+def test_reruns_backoff_with_marker(testdir, monkeypatch, factor, exp_base,
+                                    exp_max, expected):
+    marker_args = f"reruns=3, reruns_delay={factor}, reruns_delay_backoff=True"
+    if exp_base:
+        marker_args += f", reruns_delay_backoff_base={exp_base}"
+    if exp_max:
+        marker_args += f", reruns_delay_backoff_max={exp_max}"
+
+    testdir.makepyfile(
+        f"""
+        import pytest
+
+        @pytest.mark.flaky({marker_args})
+        def test_fail_two():
+            assert False"""
+    )
+
+    # Always return upper bound.
+    monkeypatch.setattr(random, "randint", lambda _, max: max)
+
+    time.sleep = mock.MagicMock()
+
+    result = testdir.runpytest()
+
+    if factor < 0:
+        result.stdout.fnmatch_lines(
+            "*UserWarning: Delay time between re-runs cannot be < 0. "
+            "Using default value: 0"
+        )
+        factor = 0
+
+    if exp_base and exp_base < 0:
+        result.stdout.fnmatch_lines(
+            "*UserWarning: Exponential backoff base cannot be < 0. "
+            f"Using default value {DELAY_BACKOFF_BASE_DEFAULT}"
+        )
+        exp_base = DELAY_BACKOFF_BASE_DEFAULT
+
+    if exp_max and exp_max < 0:
+        result.stdout.fnmatch_lines(
+            "*UserWarning: Max value for exponential backoff "
+            "cannot be < 0. Do not enforce it"
+        )
+        exp_base = None
+
+    time.sleep.assert_has_calls([mock.call(e) for e in expected])
+
+    assert_outcomes(result, passed=0, failed=1, rerun=3)
 
 
 def test_rerun_on_setup_class_with_error_with_reruns(testdir):
