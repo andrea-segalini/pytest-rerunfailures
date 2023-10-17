@@ -706,3 +706,53 @@ def test_reruns_with_string_condition_with_global_var(testdir):
     )
     result = testdir.runpytest()
     assert_outcomes(result, passed=0, failed=1, rerun=2)
+
+
+def test_nested_rerun_policies(testdir):
+    """
+    In the mock test, use a file to store a counter shared by all the test
+    runs. The behavior changes across the runs. Since we specify 2 per-test
+    reruns, and 1 global rerun (when matching "AAA" error), the expected
+    behavior is:
+    1) Test fails with 'Exception("AAA")' => Rerun under global policy (1/2 rerun).
+    2) Test fails with 'Exception("AAA")' => Rerun under global policy (2/2 rerun).
+    3) Test fails with 'Assert False' => Rerun under per-test policy (1/2 rerun),
+                                         reset nested policy.
+    4) Test fails with 'Exception("AAA")' => Rerun under global policy (1/2 rerun).
+    5) Test fails with 'Assert False' => Rerun under per-test policy (2/2 rerun),
+                                         reset nested policy.
+    6) Test succeeds.
+    """
+
+    testdir.maketxtfile(".txt", cached_value="0\n")
+    testdir.makepyfile("""
+import pytest
+
+@pytest.fixture()
+def make_memorised():
+    def make():
+        with open("cached_value.txt", "r") as f:
+            cnt = int(f.readline())
+        with open("cached_value.txt", "w") as f:
+            f.write(f"{cnt + 1}\\n")
+        return cnt
+    return make
+
+@pytest.mark.flaky(reruns=2)
+def test(make_memorised):
+    cnt = make_memorised()
+    if cnt < 2:
+        raise Exception("AAA")
+    elif cnt < 3:
+        assert False
+    elif cnt < 4:
+        raise Exception("AAA")
+    elif cnt < 5:
+        assert False
+    assert True"""
+    )
+    result = testdir.runpytest(*[
+        "--reruns", "2",
+        "--only-rerun", "AAA"
+    ])
+    assert_outcomes(result, passed=1, failed=0, rerun=5)

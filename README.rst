@@ -134,6 +134,16 @@ You can use ``@pytest.mark.flaky(condition)`` similarly as ``@pytest.mark.skipif
 
 Note that the test will re-run for any ``condition`` that is truthy.
 
+Nesting
+-------
+
+Using ``--reruns`` in combination with the per-test ``flaky`` marker, causes
+the global policy to be nested within the per-test one. This means that failed
+tests are first considered to rerun with the global policy (potentially
+matching the regex expression is specified), and then the per-test one. This
+allows to better catch and retry certain global errors that affect all tests,
+while at the same time allowing to retry a flaky test.
+
 Output
 ------
 
