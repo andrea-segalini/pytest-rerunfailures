@@ -385,7 +385,7 @@ def test_reruns_backoff(testdir, monkeypatch, factor, exp_base,
     if exp_max and exp_max < 0:
         result.stdout.fnmatch_lines(
             "*UserWarning: Max value for exponential backoff "
-            "cannot be < 0. Do not enforce it"
+            "cannot be < 0. Not enforcing it."
         )
         exp_base = None
 
@@ -444,7 +444,7 @@ def test_reruns_backoff_with_marker(testdir, monkeypatch, factor, exp_base,
     if exp_max and exp_max < 0:
         result.stdout.fnmatch_lines(
             "*UserWarning: Max value for exponential backoff "
-            "cannot be < 0. Do not enforce it"
+            "cannot be < 0. Not enforcing it."
         )
         exp_base = None
 
