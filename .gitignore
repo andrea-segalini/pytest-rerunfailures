@@ -4,7 +4,6 @@ pytest_rerunfailures.egg-info/
 .Python
 .cache/
 .idea/
-.vscode/
 .python-version
 .tox*
 bin/
