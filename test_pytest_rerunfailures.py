@@ -5,15 +5,14 @@ from unittest import mock
 import pytest
 from pkg_resources import parse_version
 
-from pytest_rerunfailures import HAS_PYTEST_HANDLECRASHITEM
 from pytest_rerunfailures import DELAY_BACKOFF_BASE_DEFAULT
 
 
 pytest_plugins = "pytester"
 
 PYTEST_GTE_60 = parse_version(pytest.__version__) >= parse_version("6.0")
+
 PYTEST_GTE_61 = parse_version(pytest.__version__) >= parse_version("6.1")
-has_xdist = HAS_PYTEST_HANDLECRASHITEM and PYTEST_GTE_61
 
 
 def temporary_failure(count=1):
@@ -24,17 +23,6 @@ def temporary_failure(count=1):
             if int(count) <= {count}:
                 path.write(int(count) + 1)
                 raise Exception('Failure: {{0}}'.format(count))"""
-
-
-def temporary_crash(count=1):
-    return f"""
-            import py
-            import os
-            path = py.path.local(__file__).dirpath().ensure('test.res')
-            count = path.read() or 1
-            if int(count) <= {count}:
-                path.write(int(count) + 1)
-                os._exit(1)"""
 
 
 def check_outcome_field(outcomes, field_name, expected_value):
@@ -180,23 +168,6 @@ def test_rerun_passes_after_temporary_test_failure(testdir):
     )
     result = testdir.runpytest("--reruns", "1", "-r", "R")
     assert_outcomes(result, passed=1, rerun=1)
-
-
-@pytest.mark.skipif(not has_xdist, reason="requires xdist with crashitem")
-def test_rerun_passes_after_temporary_test_crash(testdir):
-    # note: we need two tests because there is a bug where xdist
-    # cannot rerun the last test if it crashes. the bug exists only
-    # in xdist is there is no error that causes the bug in this plugin.
-    testdir.makepyfile(
-        f"""
-        def test_crash():
-            {temporary_crash()}
-
-        def test_pass():
-            pass"""
-    )
-    result = testdir.runpytest("-n", "1", "--reruns", "1", "-r", "R")
-    assert_outcomes(result, passed=2, rerun=1)
 
 
 def test_rerun_passes_after_temporary_test_failure_with_flaky_mark(testdir):
@@ -414,7 +385,7 @@ def test_reruns_backoff(testdir, monkeypatch, factor, exp_base,
     if exp_max and exp_max < 0:
         result.stdout.fnmatch_lines(
             "*UserWarning: Max value for exponential backoff "
-            "cannot be < 0. Do not enforce it"
+            "cannot be < 0. Not enforcing it."
         )
         exp_base = None
 
@@ -473,7 +444,7 @@ def test_reruns_backoff_with_marker(testdir, monkeypatch, factor, exp_base,
     if exp_max and exp_max < 0:
         result.stdout.fnmatch_lines(
             "*UserWarning: Max value for exponential backoff "
-            "cannot be < 0. Do not enforce it"
+            "cannot be < 0. Not enforcing it."
         )
         exp_base = None
 
@@ -735,3 +706,53 @@ def test_reruns_with_string_condition_with_global_var(testdir):
     )
     result = testdir.runpytest()
     assert_outcomes(result, passed=0, failed=1, rerun=2)
+
+
+def test_nested_rerun_policies(testdir):
+    """
+    In the mock test, use a file to store a counter shared by all the test
+    runs. The behavior changes across the runs. Since we specify 2 per-test
+    reruns, and 1 global rerun (when matching "AAA" error), the expected
+    behavior is:
+    1) Test fails with 'Exception("AAA")' => Rerun under global policy (1/2 rerun).
+    2) Test fails with 'Exception("AAA")' => Rerun under global policy (2/2 rerun).
+    3) Test fails with 'Assert False' => Rerun under per-test policy (1/2 rerun),
+                                         reset nested policy.
+    4) Test fails with 'Exception("AAA")' => Rerun under global policy (1/2 rerun).
+    5) Test fails with 'Assert False' => Rerun under per-test policy (2/2 rerun),
+                                         reset nested policy.
+    6) Test succeeds.
+    """
+
+    testdir.maketxtfile(".txt", cached_value="0\n")
+    testdir.makepyfile("""
+import pytest
+
+@pytest.fixture()
+def make_memorised():
+    def make():
+        with open("cached_value.txt", "r") as f:
+            cnt = int(f.readline())
+        with open("cached_value.txt", "w") as f:
+            f.write(f"{cnt + 1}\\n")
+        return cnt
+    return make
+
+@pytest.mark.flaky(reruns=2)
+def test(make_memorised):
+    cnt = make_memorised()
+    if cnt < 2:
+        raise Exception("AAA")
+    elif cnt < 3:
+        assert False
+    elif cnt < 4:
+        raise Exception("AAA")
+    elif cnt < 5:
+        assert False
+    assert True"""
+    )
+    result = testdir.runpytest(*[
+        "--reruns", "2",
+        "--only-rerun", "AAA"
+    ])
+    assert_outcomes(result, passed=1, failed=0, rerun=5)

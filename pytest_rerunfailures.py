@@ -1,16 +1,11 @@
-import hashlib
 import os
 import platform
 import random
 import re
-import socket
 import sys
-import threading
 import time
 import traceback
 import warnings
-from contextlib import suppress
-from copy import copy
 
 import pytest
 from _pytest.outcomes import fail
@@ -29,14 +24,6 @@ try:
 except ImportError:
     # We have a pytest >= 6.1
     pass
-
-try:
-    from xdist.newhooks import pytest_handlecrashitem
-
-    HAS_PYTEST_HANDLECRASHITEM = True
-    del pytest_handlecrashitem
-except ImportError:
-    HAS_PYTEST_HANDLECRASHITEM = False
 
 
 PYTEST_GTE_54 = parse_version(pytest.__version__) >= parse_version("5.4")
@@ -164,38 +151,24 @@ def _get_marker(item):
         return item.get_marker("flaky")
 
 
-def get_reruns_count(item):
-    rerun_marker = _get_marker(item)
-    reruns = None
-
-    # use the marker as a priority over the global setting.
-    if rerun_marker is not None:
-        if "reruns" in rerun_marker.kwargs:
-            # check for keyword arguments
-            reruns = rerun_marker.kwargs["reruns"]
-        elif len(rerun_marker.args) > 0:
-            # check for arguments
-            reruns = rerun_marker.args[0]
-        else:
-            reruns = 1
-    elif item.session.config.option.reruns:
-        # default to the global setting
-        reruns = item.session.config.option.reruns
-
-    return reruns
-
-
 # Class to generate the backoff delay given the number of attempts.
 class RerunDelay():
+    def __init__(self, delay):
+        self._delay = delay
+
+        if self._delay < 0:
+            self._delay = 0
+            warnings.warn(
+                "Delay time between re-runs cannot be < 0. Using default "
+                "value: 0"
+            )
+
     def next_rerun_delay(self, iteration_nr):
         raise NotImplementedError
 
 
 # Constant delay among reruns.
 class RerunDelayConst(RerunDelay):
-    def __init__(self, delay):
-        self._delay = delay
-
     def next_rerun_delay(self, _):
         return self._delay
 
@@ -203,87 +176,30 @@ class RerunDelayConst(RerunDelay):
 # Random exponential backoff delay.
 class RerunDelayExp(RerunDelay):
     def __init__(self, factor, base, max):
-        self._factor = factor
+        super().__init__(factor)
         self._base = base
         self._max = max
 
+        if self._base < 0:
+            self._base = DELAY_BACKOFF_BASE_DEFAULT
+            warnings.warn(
+                "Exponential backoff base cannot be < 0. Using default value "
+                f"{DELAY_BACKOFF_BASE_DEFAULT}"
+            )
+
+        if self._max and self._max < 0:
+            self._max = None
+            warnings.warn(
+                "Max value for exponential backoff cannot be < 0. "
+                "Not enforcing it."
+            )
+
     def next_rerun_delay(self, iteration_nr):
-        upper = self._factor * (self._base**iteration_nr)
+        upper = self._delay * (self._base**iteration_nr)
         if self._max:
             upper = min(self._max, upper)
 
-        return random.randint(self._factor, upper)
-
-
-def get_reruns_delay(item):
-    rerun_marker = _get_marker(item)
-
-    if rerun_marker is not None:
-        if "reruns_delay" in rerun_marker.kwargs:
-            delay = rerun_marker.kwargs["reruns_delay"]
-        elif len(rerun_marker.args) > 1:
-            # check for argument
-            delay = rerun_marker.args[1]
-        else:
-            delay = 0
-
-        if "reruns_delay_backoff" in rerun_marker.kwargs:
-            delay_backoff = rerun_marker.kwargs["reruns_delay_backoff"]
-        elif len(rerun_marker.args) > 2:
-            # check for argument
-            delay_backoff = rerun_marker.args[2]
-        else:
-            delay_backoff = False
-
-        if "reruns_delay_backoff_base" in rerun_marker.kwargs:
-            delay_backoff_base = rerun_marker.kwargs["reruns_delay_backoff_base"]
-        elif len(rerun_marker.args) > 3:
-            # check for argument
-            delay_backoff_base = rerun_marker.args[3]
-        else:
-            delay_backoff_base = DELAY_BACKOFF_BASE_DEFAULT
-
-        if "reruns_delay_backoff_max" in rerun_marker.kwargs:
-            delay_backoff_max = rerun_marker.kwargs["reruns_delay_backoff_max"]
-        elif len(rerun_marker.args) > 4:
-            # check for argument
-            delay_backoff_max = rerun_marker.args[4]
-        else:
-            delay_backoff_max = None
-
-    else:
-        delay = item.session.config.option.reruns_delay
-
-        delay_backoff = item.session.config.option.reruns_delay_backoff
-
-        delay_backoff_base = \
-            item.session.config.option.reruns_delay_backoff_base
-
-        delay_backoff_max = item.session.config.option.reruns_delay_backoff_max
-
-    if delay < 0:
-        delay = 0
-        warnings.warn(
-            "Delay time between re-runs cannot be < 0. Using default value: 0"
-        )
-
-    if delay_backoff_base < 0:
-        delay_backoff_base = DELAY_BACKOFF_BASE_DEFAULT
-        warnings.warn(
-            "Exponential backoff base cannot be < 0. Using default value "
-            f"{DELAY_BACKOFF_BASE_DEFAULT}"
-        )
-
-    if delay_backoff_max and delay_backoff_max < 0:
-        delay_backoff_max = None
-        warnings.warn(
-            "Max value for exponential backoff cannot be < 0. "
-            "Not enforcing it."
-        )
-
-    if delay_backoff:
-        return RerunDelayExp(delay, delay_backoff_base, delay_backoff_max)
-    return RerunDelayConst(delay)
+        return random.randint(self._delay, upper)
 
 
 def get_reruns_condition(item):
@@ -345,6 +261,171 @@ def evaluate_condition(item, mark, condition: object) -> bool:
     return result
 
 
+class RerunManager():
+    """
+    Manager for rerunning failed tests.
+    """
+
+    def __init__(self, item, reruns=None, delay=None, delay_backoff=None,
+                 delay_backoff_base=None, delay_backoff_max=None):
+        self._item = item
+
+        self._reruns = reruns or 0
+
+        delay = delay or 0
+        self._delay_generator = RerunDelayConst(delay)
+        if delay_backoff:
+            self._delay_generator = RerunDelayExp(
+                delay,
+                delay_backoff_base or DELAY_BACKOFF_BASE_DEFAULT,
+                delay_backoff_max
+            )
+
+        self._execution_count = 0
+
+    @property
+    def max_reruns(self):
+        return self._reruns
+
+    def match_rerun_policy(self, report):
+        """
+        Check if @report matches the rerun policy. Return a string with the
+        reason if matching, or None otherwise
+        """
+        assert report.outcome == "failed"
+
+        raise NotImplementedError()
+
+    def next_delay(self):
+        return self._delay_generator.next_rerun_delay(self._execution_count)
+
+    def prepare_rerun_test(self, report):
+        self._execution_count += 1
+
+        report.outcome = "rerun"
+        time.sleep(
+            self._delay_generator.next_rerun_delay(self._execution_count - 1)
+        )
+
+        if not (hasattr(self._item.config, "workerinput") or
+                hasattr(self._item.config, "slaveinput")) or \
+           works_with_current_xdist():
+            # will rerun test, log intermediate result
+            self._item.ihook.pytest_runtest_logreport(report=report)
+
+        # cleaning item's cashed results from any level of setups
+        _remove_cached_results_from_failed_fixtures(self._item)
+        _remove_failed_setup_state_from_session(self._item)
+
+
+class FlakyTestRerunManager(RerunManager):
+    """
+    per-test rerunning setting.
+    """
+
+    def __init__(self, item):
+        reruns = None
+        delay = None
+        delay_backoff = None
+        delay_backoff_base = None
+        delay_backoff_max = None
+        self._rerun_marker = _get_marker(item)
+        if self._rerun_marker:
+            reruns = 1
+            if "reruns" in self._rerun_marker.kwargs:
+                # check for keyword arguments
+                reruns = self._rerun_marker.kwargs["reruns"]
+            elif len(self._rerun_marker.args) > 0:
+                # check for arguments
+                reruns = self._rerun_marker.args[0]
+
+            if "reruns_delay" in self._rerun_marker.kwargs:
+                delay = self._rerun_marker.kwargs["reruns_delay"]
+            elif len(self._rerun_marker.args) > 1:
+                # check for argument
+                delay = self._rerun_marker.args[1]
+
+            if "reruns_delay_backoff" in self._rerun_marker.kwargs:
+                delay_backoff = self._rerun_marker.kwargs["reruns_delay_backoff"]
+            elif len(self._rerun_marker.args) > 2:
+                # check for argument
+                delay_backoff = self._rerun_marker.args[2]
+
+            if "reruns_delay_backoff_base" in self._rerun_marker.kwargs:
+                delay_backoff_base = \
+                    self._rerun_marker.kwargs["reruns_delay_backoff_base"]
+            elif len(self._rerun_marker.args) > 3:
+                # check for argument
+                delay_backoff_base = self._rerun_marker.args[3]
+
+            if "reruns_delay_backoff_max" in self._rerun_marker.kwargs:
+                delay_backoff_max = \
+                    self._rerun_marker.kwargs["reruns_delay_backoff_max"]
+            elif len(self._rerun_marker.args) > 4:
+                # check for argument
+                delay_backoff_max = self._rerun_marker.args[4]
+
+        super().__init__(
+            item,
+            reruns,
+            delay,
+            delay_backoff,
+            delay_backoff_base,
+            delay_backoff_max
+        )
+
+    def evaluate_rerun_policy(self, report):
+        assert report.outcome == "failed"
+
+        if self._execution_count + 1 > self.max_reruns:
+            return False
+
+        condition = get_reruns_condition(self._item)
+        if condition:
+            report.reason = ""
+            return True
+        return False
+
+
+class GlobalRerunManager(RerunManager):
+    """
+    Global test rerunning policy
+    """
+    def __init__(self, item):
+        delay = item.session.config.option.reruns_delay
+        delay_backoff = item.session.config.option.reruns_delay_backoff
+        delay_backoff_base = \
+            item.session.config.option.reruns_delay_backoff_base
+        delay_backoff_max = item.session.config.option.reruns_delay_backoff_max
+
+        self._rerun_errors = item.session.config.option.only_rerun
+
+        super().__init__(
+            item,
+            item.session.config.option.reruns,
+            delay,
+            delay_backoff,
+            delay_backoff_base,
+            delay_backoff_max
+        )
+
+    def evaluate_rerun_policy(self, report):
+        assert report.outcome == "failed"
+
+        if self._execution_count + 1 > self.max_reruns:
+            return False
+
+        if not self._rerun_errors:
+            report.reason = ""
+            return True
+
+        for rerun_regex in self._rerun_errors:
+            if re.search(rerun_regex, report.longrepr.reprcrash.message):
+                report.reason = f"Error matching '{rerun_regex}'"
+                return True
+        return False
+
+
 def _remove_cached_results_from_failed_fixtures(item):
     """Note: remove all cached_result attribute from every fixture."""
     cached_result = "cached_result"
@@ -378,36 +459,17 @@ def _remove_failed_setup_state_from_session(item):
         setup_state.stack = []
 
 
-def _should_hard_fail_on_error(session_config, report):
-    if report.outcome != "failed":
-        return False
-
-    rerun_errors = session_config.option.only_rerun
-    if not rerun_errors:
-        return False
-
-    for rerun_regex in rerun_errors:
-        if re.search(rerun_regex, report.longrepr.reprcrash.message):
-            return False
-
-    return True
-
-
-def _should_not_rerun(item, report, reruns):
+def _failed_test(report):
+    """
+    Return whether the test has failed according to the @report. Failed means
+    the test didn't pass or xfailed.
+    """
     xfail = hasattr(report, "wasxfail")
-    is_terminal_error = _should_hard_fail_on_error(item.session.config, report)
-    condition = get_reruns_condition(item)
     return (
-        item.execution_count > reruns
-        or not report.failed
-        or xfail
-        or is_terminal_error
-        or not condition
+        report.outcome == "failed" and
+        report.failed and
+        not xfail
     )
-
-
-def is_master(config):
-    return not (hasattr(config, "workerinput") or hasattr(config, "slaveinput"))
 
 
 def pytest_configure(config):
@@ -423,153 +485,6 @@ def pytest_configure(config):
         "arguments)",
     )
 
-    if HAS_PYTEST_HANDLECRASHITEM:
-        if is_master(config):
-            config.failures_db = ServerStatusDB()
-        else:
-            config.failures_db = ClientStatusDB(config.workerinput["sock_port"])
-    else:
-        config.failures_db = StatusDB()  # no-op db
-
-
-if HAS_PYTEST_HANDLECRASHITEM:
-
-    def pytest_configure_node(node):
-        """xdist hook"""
-        node.workerinput["sock_port"] = node.config.failures_db.sock_port
-
-    def pytest_handlecrashitem(crashitem, report, sched):
-        """
-        Return the crashitem from pending and collection.
-        """
-        db = sched.config.failures_db
-        reruns = db.get_test_reruns(crashitem)
-        if db.get_test_failures(crashitem) < reruns:
-            sched.mark_test_pending(crashitem)
-            report.outcome = "rerun"
-
-        db.add_test_failure(crashitem)
-
-
-# An in-memory db residing in the master that records
-# the number of reruns (set before test setup)
-# and failures (set after each failure or crash)
-# accessible from both the master and worker
-class StatusDB:
-    def __init__(self):
-        self.delim = b"\n"
-        self.hmap = {}
-
-    def _hash(self, crashitem: str) -> str:
-        if crashitem not in self.hmap:
-            self.hmap[crashitem] = hashlib.sha1(
-                crashitem.encode(),
-            ).hexdigest()[:10]
-
-        return self.hmap[crashitem]
-
-    def add_test_failure(self, crashitem):
-        hash = self._hash(crashitem)
-        failures = self._get(hash, "f")
-        failures += 1
-        self._set(hash, "f", failures)
-
-    def get_test_failures(self, crashitem):
-        hash = self._hash(crashitem)
-        return self._get(hash, "f")
-
-    def set_test_reruns(self, crashitem, reruns):
-        hash = self._hash(crashitem)
-        self._set(hash, "r", reruns)
-
-    def get_test_reruns(self, crashitem):
-        hash = self._hash(crashitem)
-        return self._get(hash, "r")
-
-    # i is a hash of the test name, t_f.py::test_t
-    # k is f for failures or r for reruns
-    # v is the number of failures or reruns (an int)
-    def _set(self, i: str, k: str, v: int):
-        pass
-
-    def _get(self, i: str, k: str) -> int:
-        return 0
-
-
-class SocketDB(StatusDB):
-    def __init__(self):
-        super().__init__()
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.setblocking(1)
-
-    def _sock_recv(self, conn) -> str:
-        buf = b""
-        while True:
-            b = conn.recv(1)
-            if b == self.delim:
-                break
-            buf += b
-
-        return buf.decode()
-
-    def _sock_send(self, conn, msg: str):
-        conn.send(msg.encode() + self.delim)
-
-
-class ServerStatusDB(SocketDB):
-    def __init__(self):
-        super().__init__()
-        self.sock.bind(("", 0))
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-        self.rerunfailures_db = {}
-        t = threading.Thread(target=self.run_server, daemon=True)
-        t.start()
-
-    @property
-    def sock_port(self):
-        return self.sock.getsockname()[1]
-
-    def run_server(self):
-        self.sock.listen()
-        while True:
-            conn, _ = self.sock.accept()
-            t = threading.Thread(target=self.run_connection, args=(conn,), daemon=True)
-            t.start()
-
-    def run_connection(self, conn):
-        with suppress(ConnectionError):
-            while True:
-                op, i, k, v = self._sock_recv(conn).split("|")
-                if op == "set":
-                    self._set(i, k, int(v))
-                elif op == "get":
-                    self._sock_send(conn, str(self._get(i, k)))
-
-    def _set(self, i: str, k: str, v: int):
-        if i not in self.rerunfailures_db:
-            self.rerunfailures_db[i] = {}
-        self.rerunfailures_db[i][k] = v
-
-    def _get(self, i: str, k: str) -> int:
-        try:
-            return self.rerunfailures_db[i][k]
-        except KeyError:
-            return 0
-
-
-class ClientStatusDB(SocketDB):
-    def __init__(self, sock_port):
-        super().__init__()
-        self.sock.connect(("localhost", sock_port))
-
-    def _set(self, i: str, k: str, v: int):
-        self._sock_send(self.sock, "|".join(("set", i, k, str(v))))
-
-    def _get(self, i: str, k: str) -> int:
-        self._sock_send(self.sock, "|".join(("get", i, k, "")))
-        return int(self._sock_recv(self.sock))
-
 
 def pytest_runtest_protocol(item, nextitem):
     """
@@ -578,8 +493,11 @@ def pytest_runtest_protocol(item, nextitem):
     Note: when teardown fails, two reports are generated for the case, one for
     the test case and the other for the teardown error.
     """
-    reruns = get_reruns_count(item)
-    if reruns is None:
+
+    test_rerun_policy = FlakyTestRerunManager(item)
+    global_rerun_policy = GlobalRerunManager(item)
+
+    if not test_rerun_policy.max_reruns and not global_rerun_policy.max_reruns:
         # global setting is not specified, and this test is not marked with
         # flaky
         return
@@ -587,15 +505,7 @@ def pytest_runtest_protocol(item, nextitem):
     # while this doesn't need to be run with every item, it will fail on the
     # first item if necessary
     check_options(item.session.config)
-    delay_generator = get_reruns_delay(item)
-    parallel = not is_master(item.config)
-    item_location = (item.location[0] + "::" + item.location[2]).replace("\\", "/")
-    db = item.session.config.failures_db
-    item.execution_count = db.get_test_failures(item_location)
-    db.set_test_reruns(item_location, reruns)
-
-    if item.execution_count > reruns:
-        return True
+    item.execution_count = 0
 
     need_to_run = True
     while need_to_run:
@@ -605,24 +515,17 @@ def pytest_runtest_protocol(item, nextitem):
 
         for report in reports:  # 3 reports: setup, call, teardown
             report.rerun = item.execution_count - 1
-            if _should_not_rerun(item, report, reruns):
-                # last run or no failure detected, log normally
-                item.ihook.pytest_runtest_logreport(report=report)
-            else:
-                # failure detected and reruns not exhausted, since i < reruns
-                report.outcome = "rerun"
-                time.sleep(
-                    delay_generator.next_rerun_delay(item.execution_count - 1))
+            if _failed_test(report):
+                if global_rerun_policy.evaluate_rerun_policy(report):
+                    global_rerun_policy.prepare_rerun_test(report)
+                    break  # trigger rerun
+                elif test_rerun_policy.evaluate_rerun_policy(report):
+                    # Reset @global_rerun_policy execution count.
+                    global_rerun_policy = GlobalRerunManager(item)
+                    test_rerun_policy.prepare_rerun_test(report)
+                    break  # trigger rerun
 
-                if not parallel or works_with_current_xdist():
-                    # will rerun test, log intermediate result
-                    item.ihook.pytest_runtest_logreport(report=report)
-
-                # cleanin item's cashed results from any level of setups
-                _remove_cached_results_from_failed_fixtures(item)
-                _remove_failed_setup_state_from_session(item)
-
-                break  # trigger rerun
+            item.ihook.pytest_runtest_logreport(report=report)
         else:
             need_to_run = False
 
@@ -634,7 +537,10 @@ def pytest_runtest_protocol(item, nextitem):
 def pytest_report_teststatus(report):
     # Adapted from https://pytest.org/latest/_modules/_pytest/skipping.html
     if report.outcome == "rerun":
-        return "rerun", "R", ("RERUN", {"yellow": True})
+        rerun_string = "RERUN"
+        if report.reason:
+            rerun_string += f": {report.reason}"
+        return "rerun", "R", (rerun_string, {"yellow": True})
 
 
 def pytest_terminal_summary(terminalreporter):
